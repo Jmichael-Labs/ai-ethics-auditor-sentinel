@@ -1,0 +1,385 @@
+name: Release and Publish
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., 1.0.0)'
+        required: true
+        type: string
+
+env:
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  validate-release:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+      
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Get version from tag or input
+      id: get_version
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          VERSION="${{ github.event.inputs.version }}"
+        else
+          VERSION=${GITHUB_REF#refs/tags/v}
+        fi
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "Release version: $VERSION"
+
+    - name: Validate version format
+      run: |
+        VERSION="${{ steps.get_version.outputs.version }}"
+        if [[ ! $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9]+)?$ ]]; then
+          echo "Invalid version format: $VERSION"
+          exit 1
+        fi
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e .
+        pip install pytest
+
+    - name: Run critical tests
+      run: |
+        pytest tests/test_core.py -v --maxfail=1
+
+  build-assets:
+    runs-on: ${{ matrix.os }}
+    needs: validate-release
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Install build dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install build wheel twine
+
+    - name: Update version in package
+      run: |
+        VERSION="${{ needs.validate-release.outputs.version }}"
+        sed -i.bak "s/__version__ = .*/__version__ = \"$VERSION\"/" sentinel/__init__.py
+      shell: bash
+
+    - name: Build distribution packages
+      run: |
+        python -m build
+
+    - name: Verify build
+      run: |
+        twine check dist/*
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: dist-${{ matrix.os }}
+        path: dist/
+
+  test-installation:
+    runs-on: ${{ matrix.os }}
+    needs: [validate-release, build-assets]
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ['3.8', '3.9', '3.10', '3.11', '3.12']
+        exclude:
+          # Test only on subset for efficiency
+          - os: windows-latest
+            python-version: '3.8'
+          - os: macos-latest
+            python-version: '3.8'
+
+    steps:
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Download build artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: dist-ubuntu-latest
+        path: dist/
+
+    - name: Test wheel installation
+      run: |
+        pip install dist/*.whl
+      shell: bash
+
+    - name: Test package import
+      run: |
+        python -c "
+        import sentinel
+        from sentinel import EthicsAuditor, BiasDetector, SafetyScanner
+        print(f'Successfully imported sentinel v{sentinel.__version__}')
+        "
+
+    - name: Test basic functionality
+      run: |
+        python -c "
+        from sentinel import EthicsAuditor
+        from sentinel.core.config import AuditConfig
+        
+        # Test basic initialization
+        config = AuditConfig(audit_components=['bias'])
+        auditor = EthicsAuditor(config=config)
+        print('Basic functionality test passed')
+        "
+
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: validate-release
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Install security tools
+      run: |
+        python -m pip install --upgrade pip
+        pip install bandit safety semgrep
+
+    - name: Run security scan with bandit
+      run: |
+        bandit -r sentinel/ -f json -o bandit-report.json
+        bandit -r sentinel/ -f txt
+
+    - name: Check dependencies for vulnerabilities
+      run: |
+        pip install -e .
+        safety check --json --output safety-report.json
+        safety check
+
+    - name: Run semgrep security scan
+      run: |
+        semgrep --config=auto sentinel/ --json --output=semgrep-report.json || true
+        
+    - name: Upload security reports
+      uses: actions/upload-artifact@v3
+      with:
+        name: security-reports
+        path: |
+          bandit-report.json
+          safety-report.json
+          semgrep-report.json
+
+  generate-changelog:
+    runs-on: ubuntu-latest
+    needs: validate-release
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Generate changelog
+      id: changelog
+      run: |
+        VERSION="${{ needs.validate-release.outputs.version }}"
+        
+        # Get previous tag
+        PREV_TAG=$(git tag --sort=-version:refname | grep -v "v$VERSION" | head -n1)
+        
+        if [ -z "$PREV_TAG" ]; then
+          PREV_TAG=$(git rev-list --max-parents=0 HEAD)
+        fi
+        
+        echo "Generating changelog from $PREV_TAG to v$VERSION"
+        
+        # Generate changelog
+        CHANGELOG=$(git log --pretty=format:"- %s (%an)" $PREV_TAG..HEAD | head -20)
+        
+        # Save to file
+        echo "# Changelog for v$VERSION" > CHANGELOG.md
+        echo "" >> CHANGELOG.md
+        echo "## New Features and Improvements" >> CHANGELOG.md
+        echo "$CHANGELOG" | grep -i "feat\|add\|new" >> CHANGELOG.md || echo "- No new features in this release" >> CHANGELOG.md
+        echo "" >> CHANGELOG.md
+        echo "## Bug Fixes" >> CHANGELOG.md
+        echo "$CHANGELOG" | grep -i "fix\|bug" >> CHANGELOG.md || echo "- No bug fixes in this release" >> CHANGELOG.md
+        echo "" >> CHANGELOG.md
+        echo "## Other Changes" >> CHANGELOG.md
+        echo "$CHANGELOG" | grep -v -i "feat\|add\|new\|fix\|bug" >> CHANGELOG.md || echo "- No other changes in this release" >> CHANGELOG.md
+        
+        # Output for GitHub release
+        echo "changelog<<EOF" >> $GITHUB_OUTPUT
+        cat CHANGELOG.md >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+
+    - name: Upload changelog
+      uses: actions/upload-artifact@v3
+      with:
+        name: changelog
+        path: CHANGELOG.md
+
+  create-github-release:
+    runs-on: ubuntu-latest
+    needs: [validate-release, build-assets, test-installation, security-scan, generate-changelog]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v3
+
+    - name: Prepare release assets
+      run: |
+        mkdir -p release-assets
+        
+        # Copy distribution files
+        cp dist-ubuntu-latest/* release-assets/
+        
+        # Copy documentation and reports
+        cp -r security-reports release-assets/ || true
+        cp changelog/CHANGELOG.md release-assets/ || true
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: v${{ needs.validate-release.outputs.version }}
+        name: Release v${{ needs.validate-release.outputs.version }}
+        body_path: changelog/CHANGELOG.md
+        files: |
+          release-assets/*
+        draft: false
+        prerelease: ${{ contains(needs.validate-release.outputs.version, '-') }}
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-pypi:
+    runs-on: ubuntu-latest
+    needs: [validate-release, test-installation, security-scan]
+    environment: release  # Requires environment approval
+
+    steps:
+    - name: Download build artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: dist-ubuntu-latest
+        path: dist/
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Install publishing tools
+      run: |
+        python -m pip install --upgrade pip
+        pip install twine
+
+    - name: Verify package integrity
+      run: |
+        twine check dist/*
+
+    - name: Publish to TestPyPI first
+      env:
+        TWINE_USERNAME: __token__
+        TWINE_PASSWORD: ${{ secrets.TEST_PYPI_API_TOKEN }}
+      run: |
+        twine upload --repository testpypi dist/* --verbose
+
+    - name: Test installation from TestPyPI
+      run: |
+        pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ ai-ethics-auditor-sentinel==${{ needs.validate-release.outputs.version }}
+        python -c "import sentinel; print(f'Test installation successful: v{sentinel.__version__}')"
+
+    - name: Publish to PyPI
+      env:
+        TWINE_USERNAME: __token__
+        TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+      run: |
+        twine upload dist/* --verbose
+
+  update-documentation:
+    runs-on: ubuntu-latest
+    needs: [create-github-release, publish-pypi]
+    if: success()
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Install documentation dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e .
+        pip install sphinx sphinx-rtd-theme
+
+    - name: Build documentation
+      run: |
+        cd docs
+        make html
+
+    - name: Deploy to GitHub Pages
+      uses: peaceiris/actions-gh-pages@v3
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        publish_dir: docs/_build/html
+        force_orphan: true
+
+  notify-success:
+    runs-on: ubuntu-latest
+    needs: [create-github-release, publish-pypi, update-documentation]
+    if: success()
+
+    steps:
+    - name: Success notification
+      run: |
+        echo "🎉 Release v${{ needs.validate-release.outputs.version }} completed successfully!"
+        echo "📦 Published to PyPI"
+        echo "📚 Documentation updated"
+        echo "🚀 GitHub release created"
+
+  notify-failure:
+    runs-on: ubuntu-latest
+    needs: [validate-release, build-assets, test-installation, security-scan, create-github-release, publish-pypi]
+    if: failure()
+
+    steps:
+    - name: Failure notification
+      run: |
+        echo "❌ Release pipeline failed!"
+        echo "Please check the logs and fix any issues before retrying."
+        exit 1

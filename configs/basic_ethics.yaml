@@ -1,0 +1,98 @@
+# Basic Ethics Audit Configuration
+# Suitable for standard compliance checks and basic bias detection
+
+# General audit settings
+audit_components:
+  - "bias"
+  - "safety"
+
+parallel_execution: true
+max_workers: 2
+log_level: "INFO"
+enable_progress_tracking: true
+save_intermediate_results: false
+
+# Taxonomy settings
+taxonomy_path: null
+custom_taxonomy: {}
+
+# Supported model types
+supported_model_types:
+  - "sklearn"
+  - "pytorch"
+  - "tensorflow"
+  - "huggingface"
+  - "custom"
+
+# Bias detection configuration
+bias:
+  # Core protected attributes for basic analysis
+  protected_attributes:
+    - "gender"
+    - "race"
+    - "age"
+  
+  # Essential fairness metrics
+  fairness_metrics:
+    - "demographic_parity"
+    - "equalized_odds"
+    - "calibration"
+  
+  # Statistical thresholds
+  significance_threshold: 0.05
+  bias_threshold: 0.15  # More lenient for basic audits
+  
+  # Sample requirements
+  min_sample_size: 100
+  bootstrap_samples: 500  # Reduced for faster execution
+  
+  # Advanced analysis options
+  intersectional_analysis: false  # Disabled for basic audits
+  temporal_analysis: false
+
+# Safety scanning configuration
+safety:
+  # Core vulnerability tests
+  vulnerability_tests:
+    - "adversarial_examples"
+    - "data_poisoning"
+    - "model_inversion"
+  
+  # Adversarial testing parameters
+  adversarial_epsilon: 0.1
+  adversarial_iterations: 20  # Reduced for basic testing
+  adversarial_step_size: 0.01
+  
+  # Robustness testing
+  noise_levels:
+    - 0.05
+    - 0.1
+  robustness_samples: 500  # Reduced for basic testing
+  
+  # Safety thresholds
+  safety_threshold: 0.6  # More lenient threshold
+  max_attack_success_rate: 0.15
+  
+  # Privacy parameters
+  privacy_budget: 1.0
+  k_anonymity: 3  # Lower requirement for basic audits
+
+# Report generation configuration
+report:
+  # Output formats
+  formats:
+    - "html"
+  
+  # Content options
+  include_visualizations: true
+  include_raw_data: false  # Simplified reporting
+  include_recommendations: true
+  detailed_explanations: false  # Basic explanations only
+  
+  # Styling
+  theme: "professional"
+  color_scheme: "default"
+  
+  # Output settings
+  output_directory: "audit_reports"
+  filename_template: "basic_audit_{timestamp}_{model_name}"
