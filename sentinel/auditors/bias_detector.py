@@ -177,11 +177,33 @@ class BiasDetector:
         # Extract true labels
         y_true = df[target_column].values
         
-        # Get model predictions
-        feature_cols = [col for col in df.columns if col != target_column]
+        # Get model predictions - exclude protected attributes and target from features
+        all_protected_attrs = set(self.config.protected_attributes)
+        
+        # Get feature columns (exclude target and any protected attributes)
+        feature_cols = [col for col in df.columns 
+                       if col != target_column and col not in all_protected_attrs]
+        
+        # If no feature columns found, try to use numeric columns only
+        if not feature_cols:
+            numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+            feature_cols = [col for col in numeric_cols if col != target_column]
+        
+        if not feature_cols:
+            raise DataValidationError("No suitable feature columns found for model prediction")
+        
         X = df[feature_cols]
         
         try:
+            # Ensure X is numeric
+            X_numeric = X.select_dtypes(include=[np.number])
+            if X_numeric.shape[1] != X.shape[1]:
+                logger.warning(f"Dropping non-numeric columns from features: {set(X.columns) - set(X_numeric.columns)}")
+                X = X_numeric
+            
+            if X.empty:
+                raise DataValidationError("No numeric features available for model prediction")
+            
             y_pred = model.predict(X)
             
             # Get prediction probabilities if available
@@ -605,72 +627,151 @@ class BiasDetector:
         y_pred: np.ndarray,
         protected_attributes: List[str]
     ) -> Dict[str, Dict[str, Any]]:
-        """Perform statistical significance tests."""
+        """Perform statistical significance tests with bootstrap confidence intervals."""
         
         statistical_tests = {}
         
         for attr in protected_attributes:
             try:
                 groups = df[attr].unique()
-                if len(groups) != 2:  # Only binary group comparisons for now
+                if len(groups) < 2:  # Need at least 2 groups
                     continue
                 
-                group1_mask = df[attr] == groups[0]
-                group2_mask = df[attr] == groups[1]
-                
-                if group1_mask.sum() < 5 or group2_mask.sum() < 5:
-                    continue  # Need minimum samples
-                
-                # Chi-square test for independence
-                contingency_table = pd.crosstab(df[attr], y_pred)
-                try:
-                    chi2, p_value_chi2, dof, expected = stats.chi2_contingency(contingency_table)
+                # For binary comparisons
+                if len(groups) == 2:
+                    group1_mask = df[attr] == groups[0]
+                    group2_mask = df[attr] == groups[1]
                     
-                    statistical_tests[f"{attr}_chi2_test"] = {
-                        "test_statistic": float(chi2),
-                        "p_value": float(p_value_chi2),
-                        "degrees_of_freedom": int(dof),
-                        "significant": p_value_chi2 < self.config.significance_threshold
-                    }
-                
-                except ValueError as e:
-                    logger.warning(f"Chi-square test failed for {attr}: {e}")
-                
-                # Two-sample t-test for prediction differences
-                group1_pred = y_pred[group1_mask].astype(float)
-                group2_pred = y_pred[group2_mask].astype(float)
-                
-                try:
-                    t_stat, p_value_t = stats.ttest_ind(group1_pred, group2_pred)
+                    if group1_mask.sum() < 5 or group2_mask.sum() < 5:
+                        continue  # Need minimum samples
                     
-                    statistical_tests[f"{attr}_ttest"] = {
-                        "test_statistic": float(t_stat),
-                        "p_value": float(p_value_t),
-                        "significant": p_value_t < self.config.significance_threshold
-                    }
-                
-                except Exception as e:
-                    logger.warning(f"T-test failed for {attr}: {e}")
-                
-                # Mann-Whitney U test (non-parametric)
-                try:
-                    u_stat, p_value_u = stats.mannwhitneyu(
-                        group1_pred, group2_pred, alternative='two-sided'
-                    )
+                    # Chi-square test for independence
+                    contingency_table = pd.crosstab(df[attr], y_pred)
+                    try:
+                        chi2, p_value_chi2, dof, expected = stats.chi2_contingency(contingency_table)
+                        
+                        # Bootstrap confidence interval for chi-square
+                        bootstrap_chi2 = self._bootstrap_chi2(df[attr], y_pred)
+                        
+                        statistical_tests[f"{attr}_chi2_test"] = {
+                            "test_statistic": float(chi2),
+                            "p_value": float(p_value_chi2),
+                            "degrees_of_freedom": int(dof),
+                            "significant": bool(p_value_chi2 < self.config.significance_threshold),
+                            "bootstrap_ci": bootstrap_chi2
+                        }
                     
-                    statistical_tests[f"{attr}_mannwhitney"] = {
-                        "test_statistic": float(u_stat),
-                        "p_value": float(p_value_u),
-                        "significant": p_value_u < self.config.significance_threshold
-                    }
+                    except ValueError as e:
+                        logger.warning(f"Chi-square test failed for {attr}: {e}")
+                    
+                    # Two-sample t-test for prediction differences
+                    group1_pred = y_pred[group1_mask].astype(float)
+                    group2_pred = y_pred[group2_mask].astype(float)
+                    
+                    try:
+                        t_stat, p_value_t = stats.ttest_ind(group1_pred, group2_pred)
+                        
+                        # Bootstrap confidence interval for mean difference
+                        mean_diff_ci = self._bootstrap_mean_difference(group1_pred, group2_pred)
+                        
+                        statistical_tests[f"{attr}_ttest"] = {
+                            "test_statistic": float(t_stat),
+                            "p_value": float(p_value_t),
+                            "significant": bool(p_value_t < self.config.significance_threshold),
+                            "mean_difference": float(np.mean(group1_pred) - np.mean(group2_pred)),
+                            "bootstrap_ci": mean_diff_ci
+                        }
+                    
+                    except Exception as e:
+                        logger.warning(f"T-test failed for {attr}: {e}")
+                    
+                    # Mann-Whitney U test (non-parametric)
+                    try:
+                        u_stat, p_value_u = stats.mannwhitneyu(
+                            group1_pred, group2_pred, alternative='two-sided'
+                        )
+                        
+                        statistical_tests[f"{attr}_mannwhitney"] = {
+                            "test_statistic": float(u_stat),
+                            "p_value": float(p_value_u),
+                            "significant": bool(p_value_u < self.config.significance_threshold)
+                        }
+                    
+                    except Exception as e:
+                        logger.warning(f"Mann-Whitney U test failed for {attr}: {e}")
                 
-                except Exception as e:
-                    logger.warning(f"Mann-Whitney U test failed for {attr}: {e}")
+                # For multi-group comparisons (ANOVA)
+                elif len(groups) > 2:
+                    group_preds = []
+                    for group in groups:
+                        group_mask = df[attr] == group
+                        if group_mask.sum() >= 5:  # Minimum samples
+                            group_preds.append(y_pred[group_mask].astype(float))
+                    
+                    if len(group_preds) >= 2:
+                        try:
+                            f_stat, p_value_f = stats.f_oneway(*group_preds)
+                            
+                            statistical_tests[f"{attr}_anova"] = {
+                                "test_statistic": float(f_stat),
+                                "p_value": float(p_value_f),
+                                "significant": bool(p_value_f < self.config.significance_threshold),
+                                "groups_tested": len(group_preds)
+                            }
+                        
+                        except Exception as e:
+                            logger.warning(f"ANOVA failed for {attr}: {e}")
             
             except Exception as e:
                 logger.warning(f"Statistical tests failed for {attr}: {e}")
         
         return statistical_tests
+    
+    def _bootstrap_chi2(self, group_data: pd.Series, predictions: np.ndarray, n_bootstrap: int = 500) -> Dict[str, float]:
+        """Bootstrap confidence interval for chi-square statistic."""
+        bootstrap_stats = []
+        n_samples = len(group_data)
+        
+        for _ in range(min(n_bootstrap, self.config.bootstrap_samples // 2)):
+            # Bootstrap resample
+            indices = np.random.choice(n_samples, n_samples, replace=True)
+            boot_groups = group_data.iloc[indices]
+            boot_preds = predictions[indices]
+            
+            try:
+                contingency = pd.crosstab(boot_groups, boot_preds)
+                if contingency.shape[0] >= 2 and contingency.shape[1] >= 2:
+                    chi2, _, _, _ = stats.chi2_contingency(contingency)
+                    bootstrap_stats.append(chi2)
+            except:
+                continue
+        
+        if bootstrap_stats:
+            return {
+                "lower": float(np.percentile(bootstrap_stats, 2.5)),
+                "upper": float(np.percentile(bootstrap_stats, 97.5)),
+                "mean": float(np.mean(bootstrap_stats))
+            }
+        else:
+            return {"lower": 0.0, "upper": 0.0, "mean": 0.0}
+    
+    def _bootstrap_mean_difference(self, group1: np.ndarray, group2: np.ndarray, n_bootstrap: int = 500) -> Dict[str, float]:
+        """Bootstrap confidence interval for mean difference between groups."""
+        bootstrap_diffs = []
+        
+        for _ in range(min(n_bootstrap, self.config.bootstrap_samples // 2)):
+            # Bootstrap resample both groups
+            boot_group1 = np.random.choice(group1, len(group1), replace=True)
+            boot_group2 = np.random.choice(group2, len(group2), replace=True)
+            
+            diff = np.mean(boot_group1) - np.mean(boot_group2)
+            bootstrap_diffs.append(diff)
+        
+        return {
+            "lower": float(np.percentile(bootstrap_diffs, 2.5)),
+            "upper": float(np.percentile(bootstrap_diffs, 97.5)),
+            "mean": float(np.mean(bootstrap_diffs))
+        }
     
     def _detect_violations(
         self,
@@ -746,17 +847,22 @@ class BiasDetector:
             if test_results.get("significant", False):
                 attr = test_name.split("_")[0]  # Extract attribute name
                 
+                evidence = {
+                    "test_name": test_name,
+                    "p_value": test_results["p_value"]
+                }
+                
+                # Add test statistic if available
+                if "test_statistic" in test_results:
+                    evidence["test_statistic"] = test_results["test_statistic"]
+                
                 violation = EthicsViolation(
                     violation_type="algorithmic_bias",
                     description=f"Statistically significant bias detected in {test_name}",
                     risk_level=RiskLevel.MEDIUM,
                     confidence=1.0 - test_results["p_value"],
                     affected_groups=[attr],
-                    evidence={
-                        "test_name": test_name,
-                        "p_value": test_results["p_value"],
-                        "test_statistic": test_results["test_statistic"]
-                    },
+                    evidence=evidence,
                     recommendations=self._get_bias_recommendations(attr, "statistical_significance")
                 )
                 violations.append(violation)

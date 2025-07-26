@@ -174,12 +174,16 @@ class HTMLReporter:
         # Combine into complete HTML
         template = self._get_html_template()
         
+        # Import RiskLevel for template access
+        from sentinel.core.results import RiskLevel
+        
         report_html = template.render(
             audit_result=audit_result,
             sections=sections,
             config=self.config,
             colors=self.colors,
             risk_colors=self.risk_colors,
+            RiskLevel=RiskLevel,  # Add RiskLevel to template context
             timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         )
         

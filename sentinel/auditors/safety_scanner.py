@@ -186,6 +186,7 @@ class SafetyScanner:
                 df = features.copy()
                 df[target_column] = labels
             else:
+                # Convert numpy arrays to DataFrame
                 df = pd.DataFrame(features)
                 df[target_column] = labels
         
@@ -197,14 +198,41 @@ class SafetyScanner:
         else:
             raise DataValidationError(f"Unsupported dataset type: {type(dataset)}")
         
-        # Extract features and labels
-        feature_cols = [col for col in df.columns if col != target_column]
-        X = df[feature_cols].values
+        # Extract true labels
         y_true = df[target_column].values
         
-        # Get model predictions
+        # Get model predictions - exclude protected attributes and target from features
+        # Common protected attributes that should be excluded from model features
+        common_protected_attrs = {'gender', 'race', 'ethnicity', 'age_group', 'religion', 
+                                 'sexual_orientation', 'nationality', 'disability', 'marital_status'}
+        
+        # Get feature columns (exclude target and any potential protected attributes)
+        feature_cols = [col for col in df.columns 
+                       if col != target_column and col.lower() not in common_protected_attrs]
+        
+        # If no feature columns found, try to use numeric columns only
+        if not feature_cols:
+            numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+            feature_cols = [col for col in numeric_cols if col != target_column]
+        
+        if not feature_cols:
+            raise DataValidationError("No suitable feature columns found for model prediction")
+        
+        X_df = df[feature_cols]
+        
         try:
+            # Ensure X is numeric - exclude non-numeric columns that could be protected attributes
+            X_numeric = X_df.select_dtypes(include=[np.number])
+            if X_numeric.shape[1] != X_df.shape[1]:
+                logger.warning(f"Dropping non-numeric columns from features: {set(X_df.columns) - set(X_numeric.columns)}")
+                X_df = X_numeric
+            
+            if X_df.empty:
+                raise DataValidationError("No numeric features available for model prediction")
+            
+            X = X_df.values
             y_pred = model.predict(X)
+            
         except Exception as e:
             raise SafetyScanError(f"Failed to get model predictions: {e}")
         
