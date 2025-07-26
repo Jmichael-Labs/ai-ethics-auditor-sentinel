@@ -224,10 +224,10 @@ This framework demonstrates **extraordinary software engineering ability** and r
 
 ## 📞 Support & Contact
 
-- **Issues**: [GitHub Issues](https://github.com/agi-ecosystem/ai-ethics-auditor-sentinel/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/agi-ecosystem/ai-ethics-auditor-sentinel/discussions)
-- **Email**: dev@agi-ecosystem.org
-- **Documentation**: [Read the Docs](https://ai-ethics-auditor-sentinel.readthedocs.io/)
+- **Issues**: GitHub Issues
+- **Discussions**: GitHub Discussions  
+- **Email**: jmichaeloficial@gmail.com
+- **Author**: Michael David Jaramillo (@Jmichael-dev)
 
 ---
 
